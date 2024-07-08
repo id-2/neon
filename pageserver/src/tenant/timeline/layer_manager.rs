@@ -71,24 +71,16 @@ impl LayerManager {
     /// 1. all on-disk layers
     /// 2. next open layer (with disk disk_consistent_lsn LSN)
     pub(crate) fn initialize_local_layers(&mut self, layers: Vec<Layer>, next_open_layer_at: Lsn) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.initialize_local_layers(layers, next_open_layer_at),
-            Closed { .. } => {
-                panic!("cannot initialize shutdown layer manager");
-            }
-        }
+        self.open_mut()
+            .expect("shutdown before initialization")
+            .initialize_local_layers(layers, next_open_layer_at);
     }
 
     /// Initialize when creating a new timeline, called in `init_empty_layer_map`.
     pub(crate) fn initialize_empty(&mut self, next_open_layer_at: Lsn) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.initialize_empty(next_open_layer_at),
-            Closed { .. } => {
-                panic!("cannot initialize shutdown layer manager");
-            }
-        }
+        self.open_mut()
+            .expect("shutdown before initialization")
+            .initialize_empty(next_open_layer_at);
     }
 
     /// Open a new writable layer to append data if there is no open layer, otherwise return the
@@ -102,14 +94,9 @@ impl LayerManager {
         gate_guard: utils::sync::gate::GateGuard,
         ctx: &RequestContext,
     ) -> anyhow::Result<Arc<InMemoryLayer>> {
-        use LayerManager::*;
-        match self {
-            Open(open) => {
-                open.get_layer_for_write(lsn, conf, timeline_id, tenant_shard_id, gate_guard, ctx)
-                    .await
-            }
-            Closed { .. } => Err(Shutdown.into()),
-        }
+        self.open_mut()?
+            .get_layer_for_write(lsn, conf, timeline_id, tenant_shard_id, gate_guard, ctx)
+            .await
     }
 
     /// Tries to freeze an open layer and also manages clearing the TimelineWriterState.
@@ -274,13 +261,9 @@ impl OpenLayerManager {
         self.layer_fmgr.get_from_desc(desc)
     }
 
-    pub(crate) fn initialize_local_layers(
-        &mut self,
-        on_disk_layers: Vec<Layer>,
-        next_open_layer_at: Lsn,
-    ) {
+    pub(crate) fn initialize_local_layers(&mut self, layers: Vec<Layer>, next_open_layer_at: Lsn) {
         let mut updates = self.layer_map.batch_update();
-        for layer in on_disk_layers {
+        for layer in layers {
             Self::insert_historic_layer(layer, &mut updates, &mut self.layer_fmgr);
         }
         updates.flush();
