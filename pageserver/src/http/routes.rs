@@ -396,7 +396,7 @@ async fn build_timeline_info_common(
         lsn @ Lsn(_) => Some(lsn),
     };
     let current_logical_size = timeline.get_current_logical_size(logical_size_task_priority, ctx);
-    let current_physical_size = Some(timeline.layer_size_sum().await);
+    let current_physical_size = timeline.layer_size_sum().await;
     let state = timeline.current_state();
     let remote_consistent_lsn_projected = timeline
         .get_remote_consistent_lsn_projected()
@@ -930,7 +930,7 @@ async fn tenant_status(
         // Calculate total physical size of all timelines
         let mut current_physical_size = 0;
         for timeline in tenant.list_timelines().iter() {
-            current_physical_size += timeline.layer_size_sum().await;
+            current_physical_size += timeline.layer_size_sum().await.unwrap_or(0);
         }
 
         let state = tenant.current_state();
@@ -1118,7 +1118,10 @@ async fn layer_map_info_handler(
     let timeline =
         active_timeline_of_active_tenant(&state.tenant_manager, tenant_shard_id, timeline_id)
             .await?;
-    let layer_map_info = timeline.layer_map_info(reset).await;
+    let layer_map_info = timeline
+        .layer_map_info(reset)
+        .await
+        .map_err(|_shutdown| ApiError::ShuttingDown)?;
 
     json_response(StatusCode::OK, layer_map_info)
 }

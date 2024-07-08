@@ -199,7 +199,7 @@ impl Timeline {
         );
 
         let layers = self.layers.read().await;
-        for layer_desc in layers.layer_map().iter_historic_layers() {
+        for layer_desc in layers.layer_map()?.iter_historic_layers() {
             let layer = layers.get_from_desc(&layer_desc);
             if layer.metadata().shard.shard_count == self.shard_identity.count {
                 // This layer does not belong to a historic ancestor, no need to re-image it.
@@ -408,13 +408,10 @@ impl Timeline {
     ) -> Result<CompactLevel0Phase1Result, CompactionError> {
         stats.read_lock_held_spawn_blocking_startup_micros =
             stats.read_lock_acquisition_micros.till_now(); // set by caller
-        let layers = guard.layer_map();
-        let level0_deltas = layers.get_level0_deltas()?;
-        let mut level0_deltas = level0_deltas
-            .into_iter()
-            .map(|x| guard.get_from_desc(&x))
-            .collect_vec();
+        let layers = guard.layer_map()?;
+        let level0_deltas = layers.level0_deltas();
         stats.level0_deltas_count = Some(level0_deltas.len());
+
         // Only compact if enough layers have accumulated.
         let threshold = self.get_compaction_threshold();
         if level0_deltas.is_empty() || level0_deltas.len() < threshold {
@@ -424,6 +421,11 @@ impl Timeline {
             );
             return Ok(CompactLevel0Phase1Result::default());
         }
+
+        let mut level0_deltas = level0_deltas
+            .iter()
+            .map(|x| guard.get_from_desc(x))
+            .collect_vec();
 
         // Gather the files to compact in this iteration.
         //
@@ -919,10 +921,9 @@ impl Timeline {
         // Find the top of the historical layers
         let end_lsn = {
             let guard = self.layers.read().await;
-            let layers = guard.layer_map();
+            let layers = guard.layer_map()?;
 
-            let l0_deltas = layers.get_level0_deltas()?;
-            drop(guard);
+            let l0_deltas = layers.level0_deltas();
 
             // As an optimization, if we find that there are too few L0 layers,
             // bail out early. We know that the compaction algorithm would do
@@ -983,7 +984,7 @@ impl Timeline {
         // 2. Inferred from (1), for each key in the layer selection, the value can be reconstructed only with the layers in the layer selection.
         let (layer_selection, gc_cutoff) = {
             let guard = self.layers.read().await;
-            let layers = guard.layer_map();
+            let layers = guard.layer_map()?;
             let gc_info = self.gc_info.read().unwrap();
             if !gc_info.retain_lsns.is_empty() || !gc_info.leases.is_empty() {
                 return Err(CompactionError::Other(anyhow!(
@@ -1306,7 +1307,7 @@ impl CompactionJobExecutor for TimelineAdaptor {
         self.flush_updates().await?;
 
         let guard = self.timeline.layers.read().await;
-        let layer_map = guard.layer_map();
+        let layer_map = guard.layer_map()?;
 
         let result = layer_map
             .iter_historic_layers()

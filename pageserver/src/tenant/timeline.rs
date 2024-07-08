@@ -535,10 +535,22 @@ pub(crate) enum PageReconstructError {
     MissingKey(MissingKeyError),
 }
 
+impl From<layer_manager::Shutdown> for PageReconstructError {
+    fn from(_: layer_manager::Shutdown) -> Self {
+        PageReconstructError::Cancelled
+    }
+}
+
 impl GetVectoredError {
     #[cfg(test)]
     pub(crate) fn is_missing_key_error(&self) -> bool {
         matches!(self, Self::MissingKey(_))
+    }
+}
+
+impl From<layer_manager::Shutdown> for GetVectoredError {
+    fn from(_: layer_manager::Shutdown) -> Self {
+        GetVectoredError::Cancelled
     }
 }
 
@@ -641,6 +653,12 @@ impl FlushLayerError {
         } else {
             Self::Other(Arc::new(err))
         }
+    }
+}
+
+impl From<layer_manager::Shutdown> for FlushLayerError {
+    fn from(_: layer_manager::Shutdown) -> Self {
+        FlushLayerError::Cancelled
     }
 }
 
@@ -1454,14 +1472,14 @@ impl Timeline {
     /// The sum of the file size of all historic layers in the layer map.
     /// This method makes no distinction between local and remote layers.
     /// Hence, the result **does not represent local filesystem usage**.
-    pub(crate) async fn layer_size_sum(&self) -> u64 {
+    ///
+    /// Returns None during tenant shutdown.
+    pub(crate) async fn layer_size_sum(&self) -> Option<u64> {
         let guard = self.layers.read().await;
-        let layer_map = guard.layer_map();
-        let mut size = 0;
-        for l in layer_map.iter_historic_layers() {
-            size += l.file_size;
-        }
-        size
+        guard
+            .layer_map()
+            .map(|lm| lm.iter_historic_layers().map(|desc| desc.file_size).sum())
+            .ok()
     }
 
     pub(crate) fn resident_physical_size(&self) -> u64 {
@@ -1651,12 +1669,19 @@ impl Timeline {
             return;
         };
 
+        // FIXME: why not early exit?
+        // if write_guard.is_none() { return; }
+
         let Ok(layers_guard) = self.layers.try_read() else {
             // Don't block if the layer lock is busy
             return;
         };
 
-        let Some(open_layer) = &layers_guard.layer_map().open_layer else {
+        let Ok(lm) = layers_guard.layer_map() else {
+            return;
+        };
+
+        let Some(open_layer) = &lm.open_layer else {
             // If there is no open layer, we have no layer freezing to do.  However, we might need to generate
             // some updates to disk_consistent_lsn and remote_consistent_lsn, in case we ingested some WAL regions
             // that didn't result in writes to this shard.
@@ -1722,33 +1747,41 @@ impl Timeline {
             self.last_freeze_at.load(),
             open_layer.get_opened_at(),
         ) {
-            let at_lsn = match open_layer.info() {
+            match open_layer.info() {
                 InMemoryLayerInfo::Frozen { lsn_start, lsn_end } => {
                     // We may reach this point if the layer was already frozen by not yet flushed: flushing
                     // happens asynchronously in the background.
                     tracing::debug!(
                         "Not freezing open layer, it's already frozen ({lsn_start}..{lsn_end})"
                     );
-                    None
                 }
                 InMemoryLayerInfo::Open { .. } => {
                     // Upgrade to a write lock and freeze the layer
                     drop(layers_guard);
                     let mut layers_guard = self.layers.write().await;
-                    let froze = layers_guard
+                    let res = layers_guard
                         .try_freeze_in_memory_layer(
                             current_lsn,
                             &self.last_freeze_at,
                             &mut write_guard,
                         )
                         .await;
-                    Some(current_lsn).filter(|_| froze)
-                }
-            };
-            if let Some(lsn) = at_lsn {
-                let res: Result<u64, _> = self.flush_frozen_layers(lsn);
-                if let Err(e) = res {
-                    tracing::info!("failed to flush frozen layer after background freeze: {e:#}");
+
+                    // it is possible the LayerManager shutdown happened between us releasing the
+                    // read lock and re-acquiring the write lock; in such case, silently do
+                    // nothing.
+
+                    let res = match res {
+                        Ok(true) => self.flush_frozen_layers(current_lsn).map(|_req| ()),
+                        Ok(false) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    };
+
+                    if let Err(e) = res {
+                        tracing::info!(
+                            "failed to flush frozen layer after background freeze: {e:#}"
+                        );
+                    }
                 }
             }
         }
@@ -1924,17 +1957,14 @@ impl Timeline {
         )
         .await;
 
-        // TODO: work toward making this a no-op. See this funciton's doc comment for more context.
+        // TODO: work toward making this a no-op. See this function's doc comment for more context.
         tracing::debug!("Waiting for tasks...");
         task_mgr::shutdown_tasks(None, Some(self.tenant_shard_id), Some(self.timeline_id)).await;
 
         {
             // Allow any remaining in-memory layers to do cleanup.
             let mut write_guard = self.write_lock.lock().await;
-            self.layers
-                .write()
-                .await
-                .drop_inmemory_layers(&mut write_guard);
+            self.layers.write().await.shutdown(&mut write_guard);
         }
 
         // Finally wait until any gate-holders are complete.
@@ -2025,9 +2055,12 @@ impl Timeline {
         }
     }
 
-    pub(crate) async fn layer_map_info(&self, reset: LayerAccessStatsReset) -> LayerMapInfo {
+    pub(crate) async fn layer_map_info(
+        &self,
+        reset: LayerAccessStatsReset,
+    ) -> Result<LayerMapInfo, layer_manager::Shutdown> {
         let guard = self.layers.read().await;
-        let layer_map = guard.layer_map();
+        let layer_map = guard.layer_map()?;
         let mut in_memory_layers = Vec::with_capacity(layer_map.frozen_layers.len() + 1);
         if let Some(open_layer) = &layer_map.open_layer {
             in_memory_layers.push(open_layer.info());
@@ -2036,16 +2069,15 @@ impl Timeline {
             in_memory_layers.push(frozen_layer.info());
         }
 
-        let mut historic_layers = Vec::new();
-        for historic_layer in layer_map.iter_historic_layers() {
-            let historic_layer = guard.get_from_desc(&historic_layer);
-            historic_layers.push(historic_layer.info(reset));
-        }
+        let historic_layers = layer_map
+            .iter_historic_layers()
+            .map(|desc| guard.get_from_desc(&desc).info(reset))
+            .collect();
 
-        LayerMapInfo {
+        Ok(LayerMapInfo {
             in_memory_layers,
             historic_layers,
-        }
+        })
     }
 
     #[instrument(skip_all, fields(tenant_id = %self.tenant_shard_id.tenant_id, shard_id = %self.tenant_shard_id.shard_slug(), timeline_id = %self.timeline_id))]
@@ -3145,6 +3177,7 @@ impl Timeline {
         let guard = self.layers.read().await;
         let layer = guard
             .layer_map()
+            .ok()?
             .iter_historic_layers()
             .find(|l| &l.layer_name() == layer_name)
             .map(|found| guard.get_from_desc(&found));
@@ -3321,7 +3354,7 @@ impl Timeline {
             }
 
             let guard = timeline.layers.read().await;
-            let layers = guard.layer_map();
+            let layers = guard.layer_map()?;
 
             // Check the open and frozen in-memory layers first, in order from newest
             // to oldest.
@@ -3563,7 +3596,7 @@ impl Timeline {
             // which turns out to be a perf bottleneck in some cases.
             if !unmapped_keyspace.is_empty() {
                 let guard = timeline.layers.read().await;
-                let layers = guard.layer_map();
+                let layers = guard.layer_map()?;
 
                 let in_memory_layer = layers.find_in_memory_layer(|l| {
                     let start_lsn = l.get_lsn_range().start;
@@ -3755,6 +3788,7 @@ impl Timeline {
             guard
                 .try_freeze_in_memory_layer(at, &self.last_freeze_at, write_lock)
                 .await
+                .expect("layer manager cannot be shutdown, because we are holding the write_lock")
         };
         if frozen {
             let now = Instant::now();
@@ -3796,7 +3830,11 @@ impl Timeline {
 
                 let layer_to_flush = {
                     let guard = self.layers.read().await;
-                    guard.layer_map().frozen_layers.front().cloned()
+                    let Ok(lm) = guard.layer_map() else {
+                        info!("dropping out of flush loop for timeline shutdown");
+                        return;
+                    };
+                    lm.frozen_layers.front().cloned()
                     // drop 'layers' lock to allow concurrent reads and writes
                 };
                 let Some(layer_to_flush) = layer_to_flush else {
@@ -4255,7 +4293,9 @@ impl Timeline {
         let threshold = self.get_image_creation_threshold();
 
         let guard = self.layers.read().await;
-        let layers = guard.layer_map();
+        let Ok(layers) = guard.layer_map() else {
+            return false;
+        };
 
         let mut max_deltas = 0;
         for part_range in &partition.ranges {
@@ -4786,6 +4826,12 @@ impl From<CollectKeySpaceError> for CompactionError {
     }
 }
 
+impl From<layer_manager::Shutdown> for CompactionError {
+    fn from(_: layer_manager::Shutdown) -> Self {
+        CompactionError::ShuttingDown
+    }
+}
+
 #[serde_as]
 #[derive(serde::Serialize)]
 struct RecordedDuration(#[serde_as(as = "serde_with::DurationMicroSeconds")] Duration);
@@ -5176,7 +5222,7 @@ impl Timeline {
         //
         // TODO holding a write lock is too agressive and avoidable
         let mut guard = self.layers.write().await;
-        let layers = guard.layer_map();
+        let layers = guard.layer_map()?;
         'outer: for l in layers.iter_historic_layers() {
             result.layers_total += 1;
 
@@ -5459,9 +5505,13 @@ impl Timeline {
 
         let remaining = {
             let guard = self.layers.read().await;
-            guard
-                .layer_map()
-                .iter_historic_layers()
+            let Ok(lm) = guard.layer_map() else {
+                // technically here we could look into iterating accessible layers, but downloading
+                // all layers of a shutdown timeline makes no sense regardless.
+                tracing::info!("attempted to download all layers of shutdown timeline");
+                return;
+            };
+            lm.iter_historic_layers()
                 .map(|desc| guard.get_from_desc(&desc))
                 .collect::<Vec<_>>()
         };
@@ -5730,7 +5780,7 @@ impl Timeline {
     ) -> anyhow::Result<Vec<(Key, Bytes)>> {
         let mut all_data = Vec::new();
         let guard = self.layers.read().await;
-        for layer in guard.layer_map().iter_historic_layers() {
+        for layer in guard.layer_map()?.iter_historic_layers() {
             if !layer.is_delta() && layer.image_layer_lsn() == lsn {
                 let layer = guard.get_from_desc(&layer);
                 let mut reconstruct_data = ValuesReconstructState::default();
@@ -5758,7 +5808,7 @@ impl Timeline {
     ) -> anyhow::Result<Vec<super::storage_layer::PersistentLayerKey>> {
         let mut layers = Vec::new();
         let guard = self.layers.read().await;
-        for layer in guard.layer_map().iter_historic_layers() {
+        for layer in guard.layer_map()?.iter_historic_layers() {
             layers.push(layer.key());
         }
         Ok(layers)
@@ -6073,6 +6123,7 @@ mod tests {
         let layers = timeline.layers.read().await;
         let desc = layers
             .layer_map()
+            .unwrap()
             .iter_historic_layers()
             .next()
             .expect("must find one layer to evict");

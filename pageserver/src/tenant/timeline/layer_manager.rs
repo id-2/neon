@@ -24,28 +24,262 @@ use crate::{
 use super::TimelineWriterState;
 
 /// Provides semantic APIs to manipulate the layer map.
-#[derive(Default)]
-pub(crate) struct LayerManager {
-    layer_map: LayerMap,
-    layer_fmgr: LayerFileManager<Layer>,
+pub(crate) enum LayerManager {
+    /// Open as in not shutdown layer manager; we still have in-memory layers and we can manipulate
+    /// the layers.
+    Open(OpenLayerManager),
+    /// Shutdown layer manager where there are no more in-memory layers and persistent layers are
+    /// read-only.
+    Closed {
+        layers: HashMap<PersistentLayerKey, Layer>,
+    },
+}
+
+impl Default for LayerManager {
+    fn default() -> Self {
+        LayerManager::Open(OpenLayerManager::default())
+    }
 }
 
 impl LayerManager {
     pub(crate) fn get_from_desc(&self, desc: &PersistentLayerDesc) -> Layer {
-        self.layer_fmgr.get_from_desc(desc)
+        use LayerManager::*;
+        let maybe = match self {
+            Open(open) => open.get_from_desc(desc),
+            Closed { layers } => layers.get(&desc.key()),
+        };
+
+        maybe
+            .with_context(|| format!("get layer from desc: {}", desc.layer_name()))
+            .expect("not found")
+            .clone()
     }
 
     /// Get an immutable reference to the layer map.
     ///
     /// We expect users only to be able to get an immutable layer map. If users want to make modifications,
     /// they should use the below semantic APIs. This design makes us step closer to immutable storage state.
-    pub(crate) fn layer_map(&self) -> &LayerMap {
-        &self.layer_map
+    pub(crate) fn layer_map(&self) -> Result<&LayerMap, Shutdown> {
+        use LayerManager::*;
+        match self {
+            Open(OpenLayerManager { layer_map, .. }) => Ok(layer_map),
+            Closed { .. } => Err(Shutdown),
+        }
     }
 
     /// Called from `load_layer_map`. Initialize the layer manager with:
     /// 1. all on-disk layers
     /// 2. next open layer (with disk disk_consistent_lsn LSN)
+    pub(crate) fn initialize_local_layers(&mut self, layers: Vec<Layer>, next_open_layer_at: Lsn) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.initialize_local_layers(layers, next_open_layer_at),
+            Closed { .. } => {
+                panic!("cannot initialize shutdown layer manager");
+            }
+        }
+    }
+
+    /// Initialize when creating a new timeline, called in `init_empty_layer_map`.
+    pub(crate) fn initialize_empty(&mut self, next_open_layer_at: Lsn) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.initialize_empty(next_open_layer_at),
+            Closed { .. } => {
+                panic!("cannot initialize shutdown layer manager");
+            }
+        }
+    }
+
+    /// Open a new writable layer to append data if there is no open layer, otherwise return the
+    /// current open layer, called within `get_layer_for_write`.
+    pub(crate) async fn get_layer_for_write(
+        &mut self,
+        lsn: Lsn,
+        conf: &'static PageServerConf,
+        timeline_id: TimelineId,
+        tenant_shard_id: TenantShardId,
+        gate_guard: utils::sync::gate::GateGuard,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<Arc<InMemoryLayer>> {
+        use LayerManager::*;
+        match self {
+            Open(open) => {
+                open.get_layer_for_write(lsn, conf, timeline_id, tenant_shard_id, gate_guard, ctx)
+                    .await
+            }
+            Closed { .. } => Err(Shutdown.into()),
+        }
+    }
+
+    /// Tries to freeze an open layer and also manages clearing the TimelineWriterState.
+    ///
+    /// Returns true if anything was frozen, fails if layer manager was shutdown already.
+    pub(super) async fn try_freeze_in_memory_layer(
+        &mut self,
+        lsn: Lsn,
+        last_freeze_at: &AtomicLsn,
+        write_lock: &mut tokio::sync::MutexGuard<'_, Option<TimelineWriterState>>,
+    ) -> Result<bool, Shutdown> {
+        use LayerManager::*;
+        match self {
+            Open(open) => Ok(open
+                .try_freeze_in_memory_layer(lsn, last_freeze_at, write_lock)
+                .await),
+            Closed { .. } => Err(Shutdown),
+        }
+    }
+
+    /// Add image layers to the layer map, called from `create_image_layers`.
+    pub(crate) fn track_new_image_layers(
+        &mut self,
+        image_layers: &[ResidentLayer],
+        metrics: &TimelineMetrics,
+    ) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.track_new_image_layers(image_layers, metrics),
+            Closed { .. } => tracing::warn!("tracked new image layers on closed layer manager"),
+        }
+    }
+
+    /// Flush a frozen layer and add the written delta layer to the layer map.
+    pub(crate) fn finish_flush_l0_layer(
+        &mut self,
+        delta_layer: Option<&ResidentLayer>,
+        frozen_layer_for_check: &Arc<InMemoryLayer>,
+        metrics: &TimelineMetrics,
+    ) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.finish_flush_l0_layer(delta_layer, frozen_layer_for_check, metrics),
+            Closed { .. } => tracing::warn!("finished flushing L0 layer on closed"),
+        }
+    }
+
+    /// LayerManager shutdown. The in-memory layers do cleanup on drop, so we must drop them in
+    /// order to allow shutdown to complete.
+    ///
+    /// If there was a want to flush in-memory layers, it must have happened earlier.
+    pub(crate) fn shutdown(&mut self, writer_state: &mut Option<TimelineWriterState>) {
+        use LayerManager::*;
+        match self {
+            Open(OpenLayerManager {
+                layer_map,
+                layer_fmgr: LayerFileManager(hashmap),
+                ..
+            }) => {
+                let open = layer_map.open_layer.take();
+                let frozen = layer_map.frozen_layers.len();
+                let taken_writer_state = writer_state.take();
+                tracing::info!(open = open.is_some(), frozen, "dropped inmemory layers");
+                let layers = std::mem::take(hashmap);
+                *self = Closed { layers };
+                assert_eq!(open.is_some(), taken_writer_state.is_some());
+            }
+            Closed { .. } => tracing::warn!("ignoring multiple shutdowns on layer manager"),
+        }
+    }
+
+    /// Called when compaction is completed.
+    pub(crate) fn finish_compact_l0(
+        &mut self,
+        compact_from: &[Layer],
+        compact_to: &[ResidentLayer],
+        metrics: &TimelineMetrics,
+    ) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.finish_compact_l0(compact_from, compact_to, metrics),
+            Closed { .. } => tracing::warn!("ignoring finish_compact_l0"),
+        }
+    }
+
+    /// Called when a GC-compaction is completed.
+    pub(crate) fn finish_gc_compaction(
+        &mut self,
+        compact_from: &[Layer],
+        compact_to: &[ResidentLayer],
+        metrics: &TimelineMetrics,
+    ) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.finish_gc_compaction(compact_from, compact_to, metrics),
+            Closed { .. } => tracing::warn!("ignoring finish_gc_compaction"),
+        }
+    }
+
+    /// Called post-compaction when some previous generation image layers were trimmed.
+    pub(crate) fn rewrite_layers(
+        &mut self,
+        rewrite_layers: &[(Layer, ResidentLayer)],
+        drop_layers: &[Layer],
+        metrics: &TimelineMetrics,
+    ) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.rewrite_layers(rewrite_layers, drop_layers, metrics),
+            Closed { .. } => tracing::warn!("ignoring rewrite_layers"),
+        }
+    }
+
+    /// Called when garbage collect has selected the layers to be removed.
+    pub(crate) fn finish_gc_timeline(&mut self, gc_layers: &[Layer]) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.finish_gc_timeline(gc_layers),
+            Closed { .. } => tracing::warn!("ignoring finish_gc_timeline"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_insert_layer(&mut self, layer: ResidentLayer) {
+        use LayerManager::*;
+        match self {
+            Open(open) => open.force_insert_layer(layer),
+            Closed { .. } => panic!("layer manager is already closed"),
+        }
+    }
+
+    pub(crate) fn likely_resident_layers(&self) -> impl Iterator<Item = Layer> + '_ {
+        self.layers()
+            .values()
+            .filter(|l| l.is_likely_resident())
+            .cloned()
+    }
+
+    pub(crate) fn contains(&self, layer: &Layer) -> bool {
+        self.layers().contains_key(&layer.layer_desc().key())
+    }
+
+    pub(crate) fn all_persistent_layers(&self) -> Vec<PersistentLayerKey> {
+        self.layers().keys().cloned().collect_vec()
+    }
+
+    fn layers(&self) -> &HashMap<PersistentLayerKey, Layer> {
+        use LayerManager::*;
+        match self {
+            Open(OpenLayerManager { layer_fmgr, .. }) => &layer_fmgr.0,
+            Closed { layers } => layers,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct OpenLayerManager {
+    layer_map: LayerMap,
+    layer_fmgr: LayerFileManager<Layer>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("layer manager has been shutdown")]
+pub(crate) struct Shutdown;
+
+impl OpenLayerManager {
+    pub(crate) fn get_from_desc(&self, desc: &PersistentLayerDesc) -> Option<&Layer> {
+        self.layer_fmgr.get_from_desc(desc)
+    }
+
     pub(crate) fn initialize_local_layers(
         &mut self,
         on_disk_layers: Vec<Layer>,
@@ -59,13 +293,10 @@ impl LayerManager {
         self.layer_map.next_open_layer_at = Some(next_open_layer_at);
     }
 
-    /// Initialize when creating a new timeline, called in `init_empty_layer_map`.
     pub(crate) fn initialize_empty(&mut self, next_open_layer_at: Lsn) {
         self.layer_map.next_open_layer_at = Some(next_open_layer_at);
     }
 
-    /// Open a new writable layer to append data if there is no open layer, otherwise return the current open layer,
-    /// called within `get_layer_for_write`.
     pub(crate) async fn get_layer_for_write(
         &mut self,
         lsn: Lsn,
@@ -122,9 +353,6 @@ impl LayerManager {
         Ok(layer)
     }
 
-    /// Tries to freeze an open layer and also manages clearing the TimelineWriterState.
-    ///
-    /// Returns true if anything was frozen.
     pub(super) async fn try_freeze_in_memory_layer(
         &mut self,
         lsn: Lsn,
@@ -164,7 +392,6 @@ impl LayerManager {
         froze
     }
 
-    /// Add image layers to the layer map, called from `create_image_layers`.
     pub(crate) fn track_new_image_layers(
         &mut self,
         image_layers: &[ResidentLayer],
@@ -182,7 +409,6 @@ impl LayerManager {
         updates.flush();
     }
 
-    /// Flush a frozen layer and add the written delta layer to the layer map.
     pub(crate) fn finish_flush_l0_layer(
         &mut self,
         delta_layer: Option<&ResidentLayer>,
@@ -208,20 +434,6 @@ impl LayerManager {
         }
     }
 
-    /// LayerManager shutdown. The in-memory layers do cleanup on drop, so we must drop them in
-    /// order to allow shutdown to complete.
-    ///
-    /// If there was a want to flush in-memory layers, it must have happened earlier.
-    pub(crate) fn drop_inmemory_layers(&mut self, writer_state: &mut Option<TimelineWriterState>) {
-        let open = self.layer_map.open_layer.take();
-        let frozen = self.layer_map.frozen_layers.len();
-        self.layer_map.frozen_layers.clear();
-        assert_eq!(open.is_some(), writer_state.is_some());
-        writer_state.take();
-        tracing::info!(open = open.is_some(), frozen, "dropped inmemory layers");
-    }
-
-    /// Called when compaction is completed.
     pub(crate) fn finish_compact_l0(
         &mut self,
         compact_from: &[Layer],
@@ -239,7 +451,6 @@ impl LayerManager {
         updates.flush();
     }
 
-    /// Called when a GC-compaction is completed.
     pub(crate) fn finish_gc_compaction(
         &mut self,
         compact_from: &[Layer],
@@ -250,7 +461,6 @@ impl LayerManager {
         self.finish_compact_l0(compact_from, compact_to, metrics)
     }
 
-    /// Called when compaction is completed.
     pub(crate) fn rewrite_layers(
         &mut self,
         rewrite_layers: &[(Layer, ResidentLayer)],
@@ -289,7 +499,6 @@ impl LayerManager {
         updates.flush();
     }
 
-    /// Called when garbage collect has selected the layers to be removed.
     pub(crate) fn finish_gc_timeline(&mut self, gc_layers: &[Layer]) {
         let mut updates = self.layer_map.batch_update();
         for doomed_layer in gc_layers {
@@ -334,27 +543,6 @@ impl LayerManager {
         mapping.remove(layer);
         layer.delete_on_drop();
     }
-
-    pub(crate) fn likely_resident_layers(&self) -> impl Iterator<Item = Layer> + '_ {
-        // for small layer maps, we most likely have all resident, but for larger more are likely
-        // to be evicted assuming lots of layers correlated with longer lifespan.
-
-        self.layer_map().iter_historic_layers().filter_map(|desc| {
-            self.layer_fmgr
-                .0
-                .get(&desc.key())
-                .filter(|l| l.is_likely_resident())
-                .cloned()
-        })
-    }
-
-    pub(crate) fn contains(&self, layer: &Layer) -> bool {
-        self.layer_fmgr.contains(layer)
-    }
-
-    pub(crate) fn all_persistent_layers(&self) -> Vec<PersistentLayerKey> {
-        self.layer_fmgr.0.keys().cloned().collect_vec()
-    }
 }
 
 pub(crate) struct LayerFileManager<T>(HashMap<PersistentLayerKey, T>);
@@ -366,14 +554,10 @@ impl<T> Default for LayerFileManager<T> {
 }
 
 impl<T: AsLayerDesc + Clone> LayerFileManager<T> {
-    fn get_from_desc(&self, desc: &PersistentLayerDesc) -> T {
+    fn get_from_desc(&self, desc: &PersistentLayerDesc) -> Option<&T> {
         // The assumption for the `expect()` is that all code maintains the following invariant:
         // A layer's descriptor is present in the LayerMap => the LayerFileManager contains a layer for the descriptor.
-        self.0
-            .get(&desc.key())
-            .with_context(|| format!("get layer from desc: {}", desc.layer_name()))
-            .expect("not found")
-            .clone()
+        self.0.get(&desc.key())
     }
 
     pub(crate) fn insert(&mut self, layer: T) {
@@ -381,10 +565,6 @@ impl<T: AsLayerDesc + Clone> LayerFileManager<T> {
         if present.is_some() && cfg!(debug_assertions) {
             panic!("overwriting a layer: {:?}", layer.layer_desc())
         }
-    }
-
-    pub(crate) fn contains(&self, layer: &T) -> bool {
-        self.0.contains_key(&layer.layer_desc().key())
     }
 
     pub(crate) fn remove(&mut self, layer: &T) {
