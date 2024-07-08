@@ -201,12 +201,10 @@ impl LayerManager {
         compact_from: &[Layer],
         compact_to: &[ResidentLayer],
         metrics: &TimelineMetrics,
-    ) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.finish_gc_compaction(compact_from, compact_to, metrics),
-            Closed { .. } => tracing::warn!("ignoring finish_gc_compaction"),
-        }
+    ) -> Result<(), Shutdown> {
+        self.open_mut()?
+            .finish_gc_compaction(compact_from, compact_to, metrics);
+        Ok(())
     }
 
     /// Called post-compaction when some previous generation image layers were trimmed.

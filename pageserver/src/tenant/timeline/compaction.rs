@@ -1229,7 +1229,7 @@ impl Timeline {
         // Step 3: Place back to the layer map.
         {
             let mut guard = self.layers.write().await;
-            guard.finish_gc_compaction(&layer_selection, &compact_to, &self.metrics)
+            guard.finish_gc_compaction(&layer_selection, &compact_to, &self.metrics)?
         };
 
         self.remote_client
