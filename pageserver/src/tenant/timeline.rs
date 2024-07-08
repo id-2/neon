@@ -1664,7 +1664,8 @@ impl Timeline {
             return;
         };
 
-        // FIXME: why not early exit?
+        // FIXME: why not early exit? because before #7927 the state would had been cleared every
+        // time, and this was missed.
         // if write_guard.is_none() { return; }
 
         let Ok(layers_guard) = self.layers.try_read() else {
