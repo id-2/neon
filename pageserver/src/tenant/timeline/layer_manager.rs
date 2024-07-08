@@ -135,12 +135,10 @@ impl LayerManager {
         &mut self,
         image_layers: &[ResidentLayer],
         metrics: &TimelineMetrics,
-    ) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.track_new_image_layers(image_layers, metrics),
-            Closed { .. } => tracing::warn!("tracked new image layers on closed layer manager"),
-        }
+    ) -> Result<(), Shutdown> {
+        self.open_mut()?
+            .track_new_image_layers(image_layers, metrics);
+        Ok(())
     }
 
     /// Flush a frozen layer and add the written delta layer to the layer map.
@@ -187,12 +185,10 @@ impl LayerManager {
         compact_from: &[Layer],
         compact_to: &[ResidentLayer],
         metrics: &TimelineMetrics,
-    ) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.finish_compact_l0(compact_from, compact_to, metrics),
-            Closed { .. } => tracing::warn!("ignoring finish_compact_l0"),
-        }
+    ) -> Result<(), Shutdown> {
+        self.open_mut()?
+            .finish_compact_l0(compact_from, compact_to, metrics);
+        Ok(())
     }
 
     /// Called when a GC-compaction is completed.

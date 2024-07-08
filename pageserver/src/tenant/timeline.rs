@@ -625,6 +625,12 @@ pub(crate) enum CreateImageLayersError {
     Other(#[from] anyhow::Error),
 }
 
+impl From<layer_manager::Shutdown> for CreateImageLayersError {
+    fn from(_: layer_manager::Shutdown) -> Self {
+        CreateImageLayersError::Cancelled
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone)]
 pub(crate) enum FlushLayerError {
     /// Timeline cancellation token was cancelled
@@ -4704,8 +4710,9 @@ impl Timeline {
         let mut guard = self.layers.write().await;
 
         // FIXME: we could add the images to be uploaded *before* returning from here, but right
-        // now they are being scheduled outside of write lock
-        guard.track_new_image_layers(&image_layers, &self.metrics);
+        // now they are being scheduled outside of write lock; current way is inconsistent with
+        // compaction lock order.
+        guard.track_new_image_layers(&image_layers, &self.metrics)?;
         drop_wlock(guard);
         timer.stop_and_record();
 
@@ -4933,11 +4940,11 @@ impl Timeline {
             .collect();
 
         if !new_images.is_empty() {
-            guard.track_new_image_layers(new_images, &self.metrics);
+            guard.track_new_image_layers(new_images, &self.metrics)?;
         }
 
         // deletion will happen later, the layer file manager calls garbage_collect_on_drop
-        guard.finish_compact_l0(&remove_layers, &insert_layers, &self.metrics);
+        guard.finish_compact_l0(&remove_layers, &insert_layers, &self.metrics)?;
 
         self.remote_client
             .schedule_compaction_update(&remove_layers, new_deltas)?;
