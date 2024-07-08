@@ -121,13 +121,10 @@ impl LayerManager {
         last_freeze_at: &AtomicLsn,
         write_lock: &mut tokio::sync::MutexGuard<'_, Option<TimelineWriterState>>,
     ) -> Result<bool, Shutdown> {
-        use LayerManager::*;
-        match self {
-            Open(open) => Ok(open
-                .try_freeze_in_memory_layer(lsn, last_freeze_at, write_lock)
-                .await),
-            Closed { .. } => Err(Shutdown),
-        }
+        Ok(self
+            .open_mut()?
+            .try_freeze_in_memory_layer(lsn, last_freeze_at, write_lock)
+            .await)
     }
 
     /// Add image layers to the layer map, called from `create_image_layers`.
