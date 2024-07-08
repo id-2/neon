@@ -5737,7 +5737,7 @@ impl Timeline {
             }
 
             let guard = self.layers.read().await;
-            for layer in guard.layer_map().iter_historic_layers() {
+            for layer in guard.layer_map()?.iter_historic_layers() {
                 if layer.is_delta()
                     && overlaps_with(&layer.lsn_range, &deltas.lsn_range)
                     && layer.lsn_range != deltas.lsn_range
