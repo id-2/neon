@@ -224,20 +224,22 @@ impl LayerManager {
     }
 
     /// Called when garbage collect has selected the layers to be removed.
-    pub(crate) fn finish_gc_timeline(&mut self, gc_layers: &[Layer]) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.finish_gc_timeline(gc_layers),
-            Closed { .. } => tracing::warn!("ignoring finish_gc_timeline"),
-        }
+    pub(crate) fn finish_gc_timeline(&mut self, gc_layers: &[Layer]) -> Result<(), Shutdown> {
+        self.open_mut()?.finish_gc_timeline(gc_layers);
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn force_insert_layer(&mut self, layer: ResidentLayer) {
+        self.open_mut().unwrap().force_insert_layer(layer)
+    }
+
+    fn open_mut(&mut self) -> Result<&mut OpenLayerManager, Shutdown> {
         use LayerManager::*;
+
         match self {
-            Open(open) => open.force_insert_layer(layer),
-            Closed { .. } => panic!("layer manager is already closed"),
+            Open(open) => Ok(open),
+            Closed { .. } => Err(Shutdown),
         }
     }
 

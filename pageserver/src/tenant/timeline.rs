@@ -5346,7 +5346,7 @@ impl Timeline {
                     }
                 })?;
 
-            guard.finish_gc_timeline(&gc_layers);
+            guard.finish_gc_timeline(&gc_layers)?;
 
             #[cfg(feature = "testing")]
             {

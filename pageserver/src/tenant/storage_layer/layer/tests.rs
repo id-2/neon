@@ -150,7 +150,7 @@ async fn smoke_test() {
     {
         let layers = &[layer];
         let mut g = timeline.layers.write().await;
-        g.finish_gc_timeline(layers);
+        g.finish_gc_timeline(layers).unwrap();
         // this just updates the remote_physical_size for demonstration purposes
         rtc.schedule_gc_update(layers).unwrap();
     }
@@ -232,7 +232,7 @@ async fn evict_and_wait_on_wanted_deleted() {
     // the deletion of the layer in remote_storage happens.
     {
         let mut layers = timeline.layers.write().await;
-        layers.finish_gc_timeline(&[layer]);
+        layers.finish_gc_timeline(&[layer]).unwrap();
     }
 
     SpawnBlockingPoolHelper::consume_and_release_all_of_spawn_blocking_threads(&handle).await;
@@ -768,7 +768,7 @@ async fn eviction_cancellation_on_drop() {
             let mut guard = timeline.layers.write().await;
             let layers = guard.likely_resident_layers().cloned().collect::<Vec<_>>();
             // remove the layers from layermap
-            guard.finish_gc_timeline(&layers);
+            guard.finish_gc_timeline(&layers).unwrap();
 
             layers
         };
