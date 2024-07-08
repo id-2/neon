@@ -1637,7 +1637,10 @@ impl Timeline {
         Ok(lease)
     }
 
-    /// Flush to disk all data that was written with the put_* functions
+    /// Flush to disk all data that was written with the put_* functions and wait for the layer to
+    /// be flushed.
+    ///
+    /// This method is used during new timeline creation, in addition to tests.
     #[instrument(skip(self), fields(tenant_id=%self.tenant_shard_id.tenant_id, shard_id=%self.tenant_shard_id.shard_slug(), timeline_id=%self.timeline_id))]
     pub(crate) async fn freeze_and_flush(&self) -> Result<(), FlushLayerError> {
         self.freeze_and_flush0().await
@@ -1646,16 +1649,19 @@ impl Timeline {
     // This exists to provide a non-span creating version of `freeze_and_flush` we can call without
     // polluting the span hierarchy.
     pub(crate) async fn freeze_and_flush0(&self) -> Result<(), FlushLayerError> {
-        let to_lsn = {
+        let token = {
             // Freeze the current open in-memory layer. It will be written to disk on next
             // iteration.
             let mut g = self.write_lock.lock().await;
 
             let to_lsn = self.get_last_record_lsn();
-            self.freeze_inmem_layer_at(to_lsn, &mut g).await;
-            to_lsn
+            self.freeze_inmem_layer_at(to_lsn, &mut g).await?
         };
-        self.flush_frozen_layers_and_wait(to_lsn).await
+        if let Some(token) = token {
+            self.wait_flush_completion(token).await
+        } else {
+            Ok(())
+        }
     }
 
     // Check if an open ephemeral layer should be closed: this provides
@@ -1707,9 +1713,9 @@ impl Timeline {
                     );
 
                     // The flush loop will update remote consistent LSN as well as disk consistent LSN.
-                    self.flush_frozen_layers_and_wait(last_record_lsn)
-                        .await
-                        .ok();
+                    if let Ok(token) = self.flush_frozen_layers(last_record_lsn) {
+                        let _ = self.wait_flush_completion(token).await;
+                    }
                 }
             }
 
@@ -1758,24 +1764,10 @@ impl Timeline {
                 InMemoryLayerInfo::Open { .. } => {
                     // Upgrade to a write lock and freeze the layer
                     drop(layers_guard);
-                    let mut layers_guard = self.layers.write().await;
-                    let res = layers_guard
-                        .try_freeze_in_memory_layer(
-                            current_lsn,
-                            &self.last_freeze_at,
-                            &mut write_guard,
-                        )
+
+                    let res = self
+                        .freeze_inmem_layer_at(current_lsn, &mut write_guard)
                         .await;
-
-                    // it is possible the LayerManager shutdown happened between us releasing the
-                    // read lock and re-acquiring the write lock; in such case, silently do
-                    // nothing.
-
-                    let res = match res {
-                        Ok(true) => self.flush_frozen_layers(current_lsn).map(|_req| ()),
-                        Ok(false) => Ok(()),
-                        Err(e) => Err(e.into()),
-                    };
 
                     if let Err(e) = res {
                         tracing::info!(
@@ -3778,21 +3770,27 @@ impl Timeline {
         self.last_record_lsn.advance(new_lsn);
     }
 
+    /// Freezes the currently open in-memory layer, and schedules a flush if an in-memory layer was
+    /// frozen.
+    ///
+    /// Returns a token which can be [`Self::wait_flush_completion`].
     async fn freeze_inmem_layer_at(
         &self,
         at: Lsn,
         write_lock: &mut tokio::sync::MutexGuard<'_, Option<TimelineWriterState>>,
-    ) {
+    ) -> Result<Option<u64>, FlushLayerError> {
         let frozen = {
             let mut guard = self.layers.write().await;
             guard
                 .try_freeze_in_memory_layer(at, &self.last_freeze_at, write_lock)
-                .await
-                .expect("layer manager cannot be shutdown, because we are holding the write_lock")
+                .await?
         };
         if frozen {
             let now = Instant::now();
             *(self.last_freeze_ts.write().unwrap()) = now;
+            Ok(Some(self.flush_frozen_layers(at)?))
+        } else {
+            Ok(None)
         }
     }
 
@@ -3949,11 +3947,6 @@ impl Timeline {
             };
             trace!("done")
         }
-    }
-
-    async fn flush_frozen_layers_and_wait(&self, at_lsn: Lsn) -> Result<(), FlushLayerError> {
-        let token = self.flush_frozen_layers(at_lsn)?;
-        self.wait_flush_completion(token).await
     }
 
     /// Flush one frozen in-memory layer to disk, as a new delta layer.
@@ -5955,11 +5948,15 @@ impl<'a> TimelineWriter<'a> {
         let current_size = self.write_guard.as_ref().unwrap().current_size;
 
         // self.write_guard will be taken by the freezing
-        self.tl
+        let res = self
+            .tl
             .freeze_inmem_layer_at(freeze_at, &mut self.write_guard)
-            .await;
+            .await?;
 
-        self.tl.flush_frozen_layers(freeze_at)?;
+        if res.is_none() {
+            let write_guard = self.write_guard.is_some();
+            tracing::error!(write_guard, "nothing was frozen, which is unexpected");
+        }
 
         if current_size >= self.get_checkpoint_distance() * 2 {
             warn!("Flushed oversized open layer with size {}", current_size)
