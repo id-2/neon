@@ -2022,6 +2022,7 @@ mod test {
             .await
             .likely_resident_layers()
             .next()
+            .cloned()
             .unwrap();
 
         {
@@ -2096,7 +2097,8 @@ mod test {
             .read()
             .await
             .likely_resident_layers()
-            .find(|x| x != &initdb_layer)
+            .find(|&x| x != &initdb_layer)
+            .cloned()
             .unwrap();
 
         // create a copy for the timeline, so we don't overwrite the file

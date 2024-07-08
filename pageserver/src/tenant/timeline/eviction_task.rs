@@ -244,6 +244,7 @@ impl Timeline {
 
                     no_activity_for > p.threshold
                 })
+                .cloned()
                 .for_each(|layer| {
                     js.spawn(async move {
                         layer

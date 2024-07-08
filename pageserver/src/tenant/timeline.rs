@@ -5617,7 +5617,7 @@ impl Timeline {
                 let last_activity_ts = layer.access_stats().latest_activity_or_now();
 
                 EvictionCandidate {
-                    layer: layer.into(),
+                    layer: layer.to_owned().into(),
                     last_activity_ts,
                     relative_last_activity: finite_f32::FiniteF32::ZERO,
                 }
