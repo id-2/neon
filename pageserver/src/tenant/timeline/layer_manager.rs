@@ -241,7 +241,7 @@ impl LayerManager {
         }
     }
 
-    /// Sum up the layer historic layer sizes
+    /// Sum up the historic layer sizes
     pub(crate) fn layer_size_sum(&self) -> u64 {
         self.layers()
             .values()
