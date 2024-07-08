@@ -147,12 +147,10 @@ impl LayerManager {
         delta_layer: Option<&ResidentLayer>,
         frozen_layer_for_check: &Arc<InMemoryLayer>,
         metrics: &TimelineMetrics,
-    ) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.finish_flush_l0_layer(delta_layer, frozen_layer_for_check, metrics),
-            Closed { .. } => tracing::warn!("finished flushing L0 layer on closed"),
-        }
+    ) -> Result<(), Shutdown> {
+        self.open_mut()?
+            .finish_flush_l0_layer(delta_layer, frozen_layer_for_check, metrics);
+        Ok(())
     }
 
     /// LayerManager shutdown. The in-memory layers do cleanup on drop, so we must drop them in

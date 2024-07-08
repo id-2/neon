@@ -4094,11 +4094,11 @@ impl Timeline {
         {
             let mut guard = self.layers.write().await;
 
-            if self.cancel.is_cancelled() {
-                return Err(FlushLayerError::Cancelled);
-            }
-
-            guard.finish_flush_l0_layer(delta_layer_to_add.as_ref(), &frozen_layer, &self.metrics);
+            guard.finish_flush_l0_layer(
+                delta_layer_to_add.as_ref(),
+                &frozen_layer,
+                &self.metrics,
+            )?;
 
             if self.set_disk_consistent_lsn(disk_consistent_lsn) {
                 // Schedule remote uploads that will reflect our new disk_consistent_lsn
