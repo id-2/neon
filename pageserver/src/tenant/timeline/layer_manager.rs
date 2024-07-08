@@ -241,6 +241,14 @@ impl LayerManager {
         }
     }
 
+    /// Sum up the layer historic layer sizes
+    pub(crate) fn layer_size_sum(&self) -> u64 {
+        self.layers()
+            .values()
+            .map(|l| l.layer_desc().file_size)
+            .sum()
+    }
+
     pub(crate) fn likely_resident_layers(&self) -> impl Iterator<Item = Layer> + '_ {
         self.layers()
             .values()

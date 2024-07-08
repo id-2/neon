@@ -1472,14 +1472,9 @@ impl Timeline {
     /// The sum of the file size of all historic layers in the layer map.
     /// This method makes no distinction between local and remote layers.
     /// Hence, the result **does not represent local filesystem usage**.
-    ///
-    /// Returns None during tenant shutdown.
-    pub(crate) async fn layer_size_sum(&self) -> Option<u64> {
+    pub(crate) async fn layer_size_sum(&self) -> u64 {
         let guard = self.layers.read().await;
-        guard
-            .layer_map()
-            .map(|lm| lm.iter_historic_layers().map(|desc| desc.file_size).sum())
-            .ok()
+        guard.layer_size_sum()
     }
 
     pub(crate) fn resident_physical_size(&self) -> u64 {
