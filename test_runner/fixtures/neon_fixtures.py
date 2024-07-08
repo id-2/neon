@@ -1263,7 +1263,7 @@ class NeonEnv:
 
         raise RuntimeError(f"Pageserver with ID {id} not found")
 
-    def get_tenant_pageserver(self, tenant_id: Union[TenantId, TenantShardId]):
+    def get_tenant_pageserver(self, tenant_id: Union[TenantId, TenantShardId]) -> Optional[NeonPageserver]:
         """
         Get the NeonPageserver where this tenant shard is currently attached, according
         to the storage controller.

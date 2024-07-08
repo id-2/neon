@@ -244,6 +244,7 @@ def test_sharding_split_compaction(neon_env_builder: NeonEnvBuilder, failpoint: 
     # Cleanup part 1: while layers are still in PITR window, we should only drop layers that are fully redundant
     for shard in shards:
         ps = env.get_tenant_pageserver(shard)
+        assert ps is not None
 
         # Invoke compaction: this should drop any layers that don't overlap with the shard's key stripes
         detail_before = ps.http_client().timeline_detail(shard, timeline_id)
@@ -269,6 +270,7 @@ def test_sharding_split_compaction(neon_env_builder: NeonEnvBuilder, failpoint: 
 
     for shard in shards:
         ps = env.get_tenant_pageserver(shard)
+        assert ps is not None
 
         # Apply failpoints for the layer-rewriting phase: this is the area of code that has sensitive behavior
         # across restarts, as we will have local layer files that temporarily disagree with the remote metadata
@@ -315,6 +317,7 @@ def test_sharding_split_compaction(neon_env_builder: NeonEnvBuilder, failpoint: 
     # Validate size statistics
     for shard in shards:
         ps = env.get_tenant_pageserver(shard)
+        assert ps is not None
         timeline_info = ps.http_client().timeline_detail(shard, timeline_id)
         reported_size = timeline_info["current_physical_size"]
         layer_paths = ps.list_layers(shard, timeline_id)
