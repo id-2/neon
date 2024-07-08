@@ -4959,7 +4959,7 @@ impl Timeline {
         replace_layers.retain(|(l, _)| guard.contains(l));
         drop_layers.retain(|l| guard.contains(l));
 
-        guard.rewrite_layers(&replace_layers, &drop_layers, &self.metrics);
+        guard.rewrite_layers(&replace_layers, &drop_layers, &self.metrics)?;
 
         let upload_layers: Vec<_> = replace_layers.into_iter().map(|r| r.1).collect();
 

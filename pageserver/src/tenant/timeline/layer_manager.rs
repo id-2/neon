@@ -215,12 +215,10 @@ impl LayerManager {
         rewrite_layers: &[(Layer, ResidentLayer)],
         drop_layers: &[Layer],
         metrics: &TimelineMetrics,
-    ) {
-        use LayerManager::*;
-        match self {
-            Open(open) => open.rewrite_layers(rewrite_layers, drop_layers, metrics),
-            Closed { .. } => tracing::warn!("ignoring rewrite_layers"),
-        }
+    ) -> Result<(), Shutdown> {
+        self.open_mut()?
+            .rewrite_layers(rewrite_layers, drop_layers, metrics);
+        Ok(())
     }
 
     /// Called when garbage collect has selected the layers to be removed.
