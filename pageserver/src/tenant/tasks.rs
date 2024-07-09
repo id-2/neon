@@ -296,6 +296,7 @@ fn log_compaction_error(
     }
 
     let decision = match e {
+        GeneratedL0 => Some(LooksLike::Error),
         ShuttingDown => None,
         _ if task_cancelled => Some(LooksLike::Info),
         Other(e) => {
