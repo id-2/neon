@@ -157,7 +157,9 @@ impl LayerManager {
                 *self = Closed { layers };
                 assert_eq!(open.is_some(), taken_writer_state.is_some());
             }
-            Closed { .. } => tracing::warn!("ignoring multiple shutdowns on layer manager"),
+            Closed { .. } => {
+                tracing::debug!("ignoring multiple shutdowns on layer manager")
+            }
         }
     }
 
