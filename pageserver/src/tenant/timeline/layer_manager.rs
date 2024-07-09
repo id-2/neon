@@ -147,7 +147,6 @@ impl LayerManager {
             Open(OpenLayerManager {
                 layer_map,
                 layer_fmgr: LayerFileManager(hashmap),
-                ..
             }) => {
                 let open = layer_map.open_layer.take();
                 let frozen = layer_map.frozen_layers.len();
