@@ -1924,6 +1924,11 @@ impl Timeline {
                     // about corner cases like s3 suddenly hanging up?
                     self.remote_client.shutdown().await;
                 }
+                Err(FlushLayerError::Cancelled) => {
+                    // this is likely the second shutdown, ignore silently.
+                    // TODO: this can be removed once https://github.com/neondatabase/neon/issues/5080
+                    debug_assert!(self.cancel.is_cancelled());
+                }
                 Err(e) => {
                     // Non-fatal.  Shutdown is infallible.  Failures to flush just mean that
                     // we have some extra WAL replay to do next time the timeline starts.
