@@ -180,7 +180,7 @@ impl Timeline {
         self: &Arc<Self>,
         rewrite_max: usize,
         ctx: &RequestContext,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompactionError> {
         let mut drop_layers = Vec::new();
         let mut layers_to_rewrite: Vec<Layer> = Vec::new();
 
