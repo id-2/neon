@@ -4731,13 +4731,7 @@ impl Timeline {
         tenant: &crate::tenant::Tenant,
         options: detach_ancestor::Options,
         ctx: &RequestContext,
-    ) -> Result<
-        (
-            completion::Completion,
-            detach_ancestor::PreparedTimelineDetach,
-        ),
-        detach_ancestor::Error,
-    > {
+    ) -> Result<detach_ancestor::Progress, detach_ancestor::Error> {
         detach_ancestor::prepare(self, tenant, options, ctx).await
     }
 
