@@ -340,3 +340,104 @@ def test_publisher_restart(
     finally:
         assert not error_occurred
         neon_api.delete_project(pub_project_id)
+
+
+@pytest.mark.remote_cluster
+@pytest.mark.timeout(2 * 60 * 60)
+def test_snap_files(
+    pg_bin: PgBin,
+    neon_api: NeonAPI,
+    pg_version: PgVersion,
+    zenbenchmark: NeonBenchmarker,
+):
+    """
+    Creates a node with a replication slot. Generates pgbench into the replication slot,
+    then runs pgbench inserts while generating large numbers of snapfiles. Then restarts
+    the node and tries to peek the replication changes.
+    """
+    test_duration_min = 60
+    test_interval_min = 5
+    pgbench_duration = f"-T{test_duration_min * 60 * 2}"
+
+    project = neon_api.create_project(pg_version)
+    project_id = project["project"]["id"]
+    endpoint_id = project["endpoints"][0]["id"]
+    neon_api.wait_for_operation_to_finish(project_id)
+    error_occurred = False
+    try:
+        env = connection_parameters_to_env(project["connection_uris"][0]["connection_parameters"])
+        connstr = project["connection_uris"][0]["connection_uri"]
+        pg_bin.run_capture(["pgbench", "-i", "-s100"], env=env)
+
+        conn = psycopg2.connect(connstr)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 'init' FROM pg_create_logical_replication_slot('slot', 'test_decoding')"
+            )
+        conn.close()
+
+        workload = pg_bin.run_nonblocking(
+            ["pgbench", "-c10", pgbench_duration, "-Mprepared"], env=env
+        )
+        try:
+            start = time.time()
+            while time.time() - start < test_duration_min * 60:
+                with psycopg2.connect(connstr) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                        SELECT data FROM
+                        pg_logical_slot_get_changes(
+                            'slot',
+                            NULL,
+                            NULL,
+                            'include-xids',
+                            '0',
+                            'skip-empty-xacts',
+                            '1')
+                        """
+                        )
+
+                check_pgbench_still_running(workload)
+                workload.terminate()
+
+                neon_api.restart_endpoint(
+                    project_id,
+                    endpoint_id,
+                )
+                neon_api.wait_for_operation_to_finish(project_id)
+
+                workload = pg_bin.run_nonblocking(
+                    ["pgbench", "-c10", pgbench_duration, "-Mprepared"],
+                    env=env,
+                )
+
+                time.sleep(test_interval_min * 60)
+
+                with psycopg2.connect(connstr) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                        select
+                        count(*)
+                        from
+                            (select pg_export_snapshot() from generate_series(1, 100000) g)
+                        s
+                        """
+                        )
+
+                # Measure storage
+                storage = neon_api.get_project_details(project_id)["project"][
+                    "synthetic_storage_size"
+                ]
+                zenbenchmark.record("storage", storage, "B", MetricReport.LOWER_IS_BETTER)
+        finally:
+            workload.terminate()
+    except Exception as e:
+        error_occurred = True
+        log.error(f"Caught exception {e}")
+        log.error(traceback.format_exc())
+    finally:
+        assert not error_occurred
+        neon_api.delete_project(project_id)
