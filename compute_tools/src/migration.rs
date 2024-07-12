@@ -62,19 +62,20 @@ impl<'m> MigrationRunner<'m> {
             let migration = self.migrations[current_migration];
 
             if migration.starts_with("-- SKIP") {
-                info!("Skipping migration id={}", current_migration);
+                info!("Skipping migration id={}", current_migration + 1);
             } else {
                 info!(
                     "Running migration id={}:\n{}\n",
-                    current_migration, migration
+                    current_migration + 1,
+                    migration
                 );
 
                 self.client
                     .simple_query("BEGIN")
-                    .context("run_migrations begin")?;
+                    .context("begin migration")?;
 
                 self.client.simple_query(migration).with_context(|| {
-                    format!("run_migration current_migration={}", current_migration)
+                    format!("run_migration migration id={}", current_migration + 1)
                 })?;
 
                 // Migration IDs start at 1
@@ -82,7 +83,7 @@ impl<'m> MigrationRunner<'m> {
 
                 self.client
                     .simple_query("COMMIT")
-                    .context("run_migrations commit")?;
+                    .context("commit migration")?;
             }
 
             current_migration += 1;
