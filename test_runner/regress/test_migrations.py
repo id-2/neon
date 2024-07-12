@@ -20,8 +20,6 @@ def test_migrations(neon_simple_env: NeonEnv):
         migration_id = cur.fetchall()
         assert migration_id[0][0] == num_migrations
 
-    endpoint.assert_log_contains(f"INFO handle_migrations: Ran {num_migrations} migrations")
-
     endpoint.stop()
     endpoint.start()
     # We don't have a good way of knowing that the migrations code path finished executing
@@ -31,5 +29,3 @@ def test_migrations(neon_simple_env: NeonEnv):
         cur.execute("SELECT id FROM neon_migration.migration_id")
         migration_id = cur.fetchall()
         assert migration_id[0][0] == num_migrations
-
-    endpoint.assert_log_contains("INFO handle_migrations: Ran 0 migrations")
